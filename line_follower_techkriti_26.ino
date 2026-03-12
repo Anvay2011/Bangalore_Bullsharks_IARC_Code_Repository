@@ -1,668 +1,197 @@
 #include <Arduino.h>
-#include <Adafruit_Sensor.h>
-#include <Adafruit_BNO055.h>
-#include <vector>
+#include <BluetoothSerial.h>
 
+BluetoothSerial SerialBT;
 
-Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
-
-// === Encoder settings & pins ===
-#define L_ENC_A 19
-#define L_ENC_B 23
-#define R_ENC_A 5
-#define R_ENC_B 18
-
-volatile long leftCount = 0;
-volatile long rightCount = 0;
-
-const int CPR = 1414;                    // counts per revolution (your measured value)
-const float wheel_circumference_cm = 13.2; 
-// --- Motor pins ---
+// ─────────────────────────────────────────────
+//  MOTOR PINS
+// ─────────────────────────────────────────────
 #define lf 14
 #define lb 27
 #define rf 13
 #define rb 12
-// --- Sensors ---
+
+// ─────────────────────────────────────────────
+//  SENSOR PINS  (L4=leftmost, R4=rightmost)
+// ─────────────────────────────────────────────
 #define NUM_SENSORS 8
-int stateVar = 0;              // variable you want to set
-int lastButtonState = HIGH;  
 int L4 = 26, L3 = 25, L2 = 33, L1 = 32;
 int R1 = 35, R2 = 34, R3 = 15, R4 = 2;
-int end = 0;
 int sensorPins[NUM_SENSORS] = {L4, L3, L2, L1, R1, R2, R3, R4};
-int sensorValues[NUM_SENSORS];
-int l4, l3, l2, l1, r1, r2, r3, r4;
-float targetYaw = 0.0;   
-// --- PID Params ---
-int speed = 255;
-int maxSpeed = speed;
-int baseSpeed = 255;    // cruising forward speed when straight
-int minSpeed = 150;     // minimum motor speed (avoid stalling)
-int prevLeftSpeed = 0;
-int prevRightSpeed = 0;
-const int SLEW_LIMIT = 18;
-float Kp = 50000000000.0;
-float Kp2 = 110.0;
 
-// Behavior tuning
-const int CENTER_DEADZONE = 200; // error units (0..7000) treated as "straight"
-const int CENTER_LOW_INDEX = 3;  // index of left-center sensor
-const int CENTER_HIGH_INDEX = 4; // index of right-center sensor
+// Weights: L4=-35  L3=-25  L2=-15  L1=-5  R1=+5  R2=+15  R3=+25  R4=+35
+const int WEIGHT[NUM_SENSORS] = {-35, -25, -15, -5, 5, 15, 25, 35};
 
-// Last known error (used for lost-line recovery)
-int lastKnownError = 0;// --- Utils ---
-float getYaw() {
-  sensors_event_t event;
-  bno.getEvent(&event);
-  return event.orientation.x;
-}
+// ─────────────────────────────────────────────
+//  PD PARAMETERS  (tune via Bluetooth "C")
+// ─────────────────────────────────────────────
+float Kp        = 1.5f;
+float Kd        = 10.0f;
+float lastError = 0.0f;
 
-float wrapAngle(float angle) {
-  if (angle > 180) angle -= 360;
-  if (angle < -180) angle += 360;
-  return angle;
-}
+// ─────────────────────────────────────────────
+//  SPEED SETTINGS
+// ─────────────────────────────────────────────
+int baseSpeed = 200;
+int maxSpeed  = 230;
+int minSpeed  = 80;
 
+// ─────────────────────────────────────────────
+//  ROBOT STATE
+// ─────────────────────────────────────────────
+bool   running  = false;
+String btBuffer = "";
 
-void applyMotors(int leftPWM, int rightPWM) {
-  leftPWM = constrain(leftPWM, -255, 255);
-  rightPWM = constrain(rightPWM, -255, 255);
+// ─────────────────────────────────────────────
+//  MISC
+// ─────────────────────────────────────────────
+#define BUTTON_PIN 4
+#define led        16
 
-  // Slew limiter (smooth transitions)
-  int dL = leftPWM - prevLeftSpeed;
-  if (dL > SLEW_LIMIT) leftPWM = prevLeftSpeed + SLEW_LIMIT;
-  else if (dL < -SLEW_LIMIT) leftPWM = prevLeftSpeed - SLEW_LIMIT;
-
-  int dR = rightPWM - prevRightSpeed;
-  if (dR > SLEW_LIMIT) rightPWM = prevRightSpeed + SLEW_LIMIT;
-  else if (dR < -SLEW_LIMIT) rightPWM = prevRightSpeed - SLEW_LIMIT;
-
-  // Drive left motor
-  if (leftPWM >= 0) {
-    analogWrite(lf, leftPWM);
-    analogWrite(lb, 0);
-  } else {
-    analogWrite(lf, 0);
-    analogWrite(lb, -leftPWM);
-  }
-
-  // Drive right motor
-  if (rightPWM >= 0) {
-    analogWrite(rf, rightPWM);
-    analogWrite(rb, 0);
-  } else {
-    analogWrite(rf, 0);
-    analogWrite(rb, -rightPWM);
-  }
-
-  prevLeftSpeed = leftPWM;
-  prevRightSpeed = rightPWM;
-}
-void lineFollowP() {
-  for (int i = 0; i < 8; i++) {
-    // invert so black line -> 1, white -> 0 (user requested that logic)
-    sensorValues[i] = !digitalRead(sensorPins[i]);
-  }
-
-  // Weighted position (indices 0..7 => weights 0..7000)
-  long numerator = 0;
-  int activeCount = 0;
-  for (int i = 0; i < 8; i++) {
-    if (sensorValues[i]) {
-      numerator += (long)i * 1000L;
-      activeCount++;
-    }
-  }
-
-  // If no sensors active -> lost line
-  if (activeCount == 0) {
-    // gentle search toward last known side (use lastKnownError sign)
-    int steer = 0;
-    if (lastKnownError > 0) steer = 80;       // steer right
-    else if (lastKnownError < 0) steer = -80; // steer left
-    else steer = 0; // unknown, go moderately forward
-
-    int leftSpeed = baseSpeed - steer;
-    int rightSpeed = baseSpeed + steer;
-
-    // keep within min/max
-    leftSpeed = constrain(leftSpeed, minSpeed, maxSpeed);
-    rightSpeed = constrain(rightSpeed, minSpeed, maxSpeed);
-
-    applyMotors(leftSpeed, rightSpeed);
-    return;
-  }
-
-  int position = (int)(numerator / activeCount); // 0..7000
-  const int center = 3500;
-  int error = position - center; // negative -> line left, positive -> line right
-
-  // Remember last known error for recovery
-  lastKnownError = error;
-
-  // If error is small => treat as straight line (no correction)
-  if (abs(error) <= CENTER_DEADZONE) {
-    int leftSpeed = baseSpeed;
-    int rightSpeed = baseSpeed;
-    applyMotors(leftSpeed, rightSpeed);
-    return;
-  }
-
-  // Quick central-sensors shortcut: if only the two center sensors detect line, go straight
-  bool onlyCenter = (sensorValues[CENTER_LOW_INDEX] && sensorValues[CENTER_HIGH_INDEX]);
-  for (int i = 0; i < 8; i++) {
-    if (i != CENTER_LOW_INDEX && i != CENTER_HIGH_INDEX && sensorValues[i]) {
-      onlyCenter = false;
-      break;
-    }
-  }
-  if (onlyCenter) {
-    int leftSpeed = baseSpeed;
-    int rightSpeed = baseSpeed;
-    applyMotors(leftSpeed, rightSpeed);
-    return;
-  }
-
-  // Proportional correction (scale error so it maps well to PWM)
-  // position range center..edge ~= 3500 -> use /3500 to normalize
-  int rawCorrection = (int)(Kp * (float)error / 3500.0);
-
-  // Constrain correction so P doesn't overshoot strongly on sharp errors
-  int maxCorrection = baseSpeed - minSpeed; // prevent stopping one motor completely
-  rawCorrection = constrain(rawCorrection, -maxCorrection, maxCorrection);
-
-  // If the outer sensors are active, we can allow slightly larger corrections
-  if (sensorValues[0] || sensorValues[7]) {
-    // outermost sensor triggered -> increase correction margin slightly (still P-only)
-    rawCorrection = constrain(rawCorrection, -maxCorrection, maxCorrection);
-  }
-
-  // Compute motor speeds
-  int leftSpeed = baseSpeed - rawCorrection;
-  int rightSpeed = baseSpeed + rawCorrection;
-
-  // Ensure min and max
-  leftSpeed = constrain(leftSpeed, minSpeed, maxSpeed);
-  rightSpeed = constrain(rightSpeed, minSpeed, maxSpeed);
-
-  applyMotors(leftSpeed, rightSpeed);
-}
-
-
-
-void update() {
-  r4 = digitalRead(R4);
-  r3 = digitalRead(R3);
-  r2 = digitalRead(R2);
-  r1 = digitalRead(R1);
-  l4 = digitalRead(L4);
-  l3 = digitalRead(L3);
-  l2 = digitalRead(L2);
-  l1 = digitalRead(L1);
-}
-
-// ---------- NEW forward(speed, distance_cm) using driveMotors ----------
-void forward(int spd, float distance_cm) {
-
-  // Reset encoder counts
-  leftCount = 0;
-  rightCount = 0;
-
-  // Convert target distance → encoder counts
-  long targetCounts = (long)((distance_cm / wheel_circumference_cm) * CPR);
-
-  // Start motors forward
-  driveMotors(spd, spd);
-
-  // Move until BOTH wheels reach the target
-  while ((leftCount < targetCounts) && (rightCount < targetCounts)) {
-    // Do nothing → just wait until encoders reach distance
-    delay(1);  
-  }
-
-  // Stop motors
-  stop();
-
-}
-
-// ---------- STOP function ----------
-void stop() {
+// ═════════════════════════════════════════════
+//  MOTOR CONTROL
+// ═════════════════════════════════════════════
+void stopMotors() {
   analogWrite(lf, 0); analogWrite(lb, 0);
   analogWrite(rf, 0); analogWrite(rb, 0);
 }
 
-// ---------- Encoder ISRs ----------
-void IRAM_ATTR isr_left() {
-  int A = digitalRead(L_ENC_A);
-  int B = digitalRead(L_ENC_B);
-  if (A == B) leftCount++;
-  else leftCount--;
+// ═════════════════════════════════════════════
+//  PD LINE FOLLOW
+// ═════════════════════════════════════════════
+void pdLineFollow() {
+  long weightedSum = 0;
+  int  activeCount = 0;
+
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    if (digitalRead(sensorPins[i]) == 0) {  // 0 = on line
+      weightedSum += WEIGHT[i];
+      activeCount++;
+    }
+  }
+
+  float error;
+  if (activeCount == 0) {
+    error = lastError;  // lost line — hold last direction
+  } else {
+    error = (float)weightedSum / (float)activeCount;
+  }
+
+  float derivative = error - lastError;
+  float correction = (Kp * error) + (Kd * derivative);
+  lastError = error;
+
+  int leftSpeed  = constrain(baseSpeed + (int)correction, minSpeed, maxSpeed);
+  int rightSpeed = constrain(baseSpeed - (int)correction, minSpeed, maxSpeed);
+
+  analogWrite(lf, leftSpeed);  analogWrite(lb, 0);
+  analogWrite(rf, rightSpeed); analogWrite(rb, 0);
 }
 
-void IRAM_ATTR isr_right() {
-  int A = digitalRead(R_ENC_A);
-  int B = digitalRead(R_ENC_B);
-  if (A == B) rightCount++;
-  else rightCount--;
-}
+// ═════════════════════════════════════════════
+//  BLUETOOTH
+// ═════════════════════════════════════════════
+void processCommand(String cmd);
+void enterTuningMode();
 
-void turnToYaw(float targetYaw) {
-  unsigned long startTime = millis();
-
-  while (true) {
-    float currentYaw = getYaw();
-    float error = wrapAngle(targetYaw - currentYaw); // -180 .. +180
-    float absError = abs(error);
-    update();
-    if(l4 == 0 ){
-      while (true){
-              update();
-analogWrite(lf,0);
-analogWrite(lb,200);
-analogWrite(rf,200);
-analogWrite(rb,0);
-
-        if(l1 == 0 || r1 == 0){
-          stop();
-          break;
-        }
+void handleBluetooth() {
+  while (SerialBT.available()) {
+    char c = (char)SerialBT.read();
+    if (c == '\n' || c == '\r') {
+      btBuffer.trim();
+      if (btBuffer.length() > 0) processCommand(btBuffer);
+      btBuffer = "";
+    } else {
+      btBuffer += c;
+      if (btBuffer == "S" || btBuffer == "E" || btBuffer == "C") {
+        processCommand(btBuffer);
+        btBuffer = "";
       }
     }
-    // Stop condition
-    if (absError <= 2.0) break;
-    if (millis() - startTime > 4000) break;  // safety timeout
-
-    // Proportional speed control
-    int turnSpeed = (int)(absError * 3.0);   // KP ≈ 3
-    turnSpeed = constrain(turnSpeed, 70, 220);
-
-    // Direction based on sign of error
-    if (error > 0) {
-      // CW
-      driveMotors(turnSpeed, -turnSpeed);
-    } else {
-      // CCW
-      driveMotors(-turnSpeed, turnSpeed);
-    }
-
-    delay(10);
-  }
-
-  stop();
-  delay(50);
-}
-
-// ---- U-TURN (180° shortest spin) ----
-
-
-
-void driveMotors(int leftPWM, int rightPWM) {
-  // Clamp PWM values between -255 and 255
-  leftPWM = constrain(leftPWM, -255, 255);
-  rightPWM = constrain(rightPWM, -255, 255);
-
-  if (leftPWM > 0) {
-    analogWrite(lf, leftPWM);
-    analogWrite(lb, 0);
-  } else if (leftPWM < 0) {
-    analogWrite(lf, 0);
-    analogWrite(lb, -leftPWM);
-  } else {
-    analogWrite(lf, 0);
-    analogWrite(lb, 0);
-  }
-
-  if (rightPWM > 0) {
-    analogWrite(rf, rightPWM);
-    analogWrite(rb, 0);
-  } else if (rightPWM < 0) {
-    analogWrite(rf, 0);
-    analogWrite(rb, -rightPWM);
-  } else {
-    analogWrite(rf, 0);
-    analogWrite(rb, 0);
   }
 }
 
-void alignToLine(int alignSpeed = 150) {
-  update();
-
-  // Already aligned
-  if (l1 == 0 || r1 == 0) {
-    return;
-  }
-
-  // Line detected on RIGHT side → rotate RIGHT
-  if (r2 == 0 || r3 == 0 || r4 == 0) {
-    while (true) {
-      update();
-      if (l1 == 0 || r1 == 0) break;
-
-      analogWrite(lf, alignSpeed);
-      analogWrite(lb, 0);
-      analogWrite(rf, 0);
-      analogWrite(rb, alignSpeed);
-    }
-  }
-  // Line detected on LEFT side → rotate LEFT
-  else if (l2 == 0 || l3 == 0 || l4 == 0) {
-    while (true) {
-      update();
-      if (l1 == 0 || r1 == 0) break;
-
-      analogWrite(lf, 0);
-      analogWrite(lb, alignSpeed);
-      analogWrite(rf, alignSpeed);
-      analogWrite(rb, 0);
-    }
-  }
-}
-void left(int speed) {
-  update();
-  if(l3 == 0){
-    while (true) {
-        update();
-
-        if (r3 == 0) {
-          stop();
-            break;
-        }
-
-         analogWrite(lf, 0);
-        analogWrite(lb, 200);
-        analogWrite(rf, 200);
-        analogWrite(rb, 0); 
-    }
-  }
-while (true) {
-        update();
-
-        if (l3 == 0 ) {
-              stop();
-
-            break;
-        }
-
-        analogWrite(lf, 0);
-        analogWrite(lb, 200);
-        analogWrite(rf, 200);
-        analogWrite(rb, 0); 
-        
-    }
-    while (true) {
-        update();
-
-        if (r1 == 0) {
-            break;
-        }
-
-         analogWrite(lf, 0);
-        analogWrite(lb, 200);
-        analogWrite(rf, 200);
-        analogWrite(rb, 0); 
-    }
-    alignToLine();
-}
-void right(int speed) {
-  update();
-  if(r3 == 0){
-     while (true) {
-        update();
-
-        if (r3 == 0 ) {
-            break;
-        }
-
-        analogWrite(lf, 200);
-        analogWrite(lb, 0);
-        analogWrite(rf, 0);
-        analogWrite(rb, 200); 
-    }
-  }
- while (true) {
-        update();
-
-        if (r3 == 0 ) {
-            break;
-        }
-
-        analogWrite(lf, 200);
-        analogWrite(lb, 0);
-        analogWrite(rf, 0);
-        analogWrite(rb, 200); 
-    }
-    while (true) {
-        update();
-
-        if (l1 == 0 ) {
-            break;
-        }
-
-         analogWrite(lf, 200);
-        analogWrite(lb, 0);
-        analogWrite(rf, 0);
-        analogWrite(rb, 200); 
-    }
-        alignToLine();
-
-}
-
-
-void u_turn(int speed) {
-  float startYaw = getYaw();
-  float targetYaw = startYaw - 170.0;
-  if (targetYaw < 0) targetYaw += 360.0;
-
-  // Force CCW rotation
-  while (true) {
-    float currentYaw = getYaw();
-    float error = wrapAngle(targetYaw - currentYaw);
-    update();
-      if((l1 == 0 && l2 == 0)|| ((l1 == 0 || l2 ==0)&& abs(error) <45)){
-        alignToLine();
-      break;
-    }
-    if (abs(error) <= 2.0) break;
-
-    int turnSpeed = constrain(abs(error) * 3.0, 80, 220);
-
-    driveMotors(-turnSpeed, turnSpeed);  // CCW ONLY
-    delay(10);
-  }
-
-  stop();
-}
-
-#define BUTTON_PIN 4  // your button connected to GPIO14 and GND
-
-#define led 16
-void blinkLED(int times) {
-  for (int i = 0; i < times; i++) {
-    digitalWrite(led, HIGH);
-    delay(250);
-    digitalWrite(led, LOW);
-    delay(250);
+void processCommand(String cmd) {
+  cmd.toUpperCase();
+  if (cmd == "S") {
+    running = true; lastError = 0.0f;
+    SerialBT.println(">> STARTED");
+  } else if (cmd == "E") {
+    running = false; stopMotors();
+    SerialBT.println(">> STOPPED");
+  } else if (cmd == "C") {
+    enterTuningMode();
   }
 }
 
+void enterTuningMode() {
+  bool wasRunning = running;
+  running = false;
+  stopMotors();
+
+  SerialBT.println("── PD TUNING ──");
+  SerialBT.print("Kp="); SerialBT.print(Kp);
+  SerialBT.print("  Kd="); SerialBT.println(Kd);
+
+  // Read Kp
+  SerialBT.println("Enter Kp then Enter:");
+  String input = ""; unsigned long t = millis() + 15000;
+  while (millis() < t) {
+    if (SerialBT.available()) {
+      char c = (char)SerialBT.read();
+      if (c == '\n' || c == '\r') { input.trim(); if (input.length()) break; }
+      else input += c;
+    }
+  }
+  if (input.length()) { Kp = input.toFloat(); SerialBT.print("Kp="); SerialBT.println(Kp); }
+  else SerialBT.println("Timeout — Kp unchanged.");
+
+  // Read Kd
+  SerialBT.println("Enter Kd then Enter:");
+  input = ""; t = millis() + 15000;
+  while (millis() < t) {
+    if (SerialBT.available()) {
+      char c = (char)SerialBT.read();
+      if (c == '\n' || c == '\r') { input.trim(); if (input.length()) break; }
+      else input += c;
+    }
+  }
+  if (input.length()) { Kd = input.toFloat(); SerialBT.print("Kd="); SerialBT.println(Kd); }
+  else SerialBT.println("Timeout — Kd unchanged.");
+
+  SerialBT.println("── Done ──  S=Start  E=Stop  C=Tune");
+  if (wasRunning) { running = true; lastError = 0.0f; SerialBT.println(">> Resuming..."); }
+}
+
+// ═════════════════════════════════════════════
+//  SETUP
+// ═════════════════════════════════════════════
 void setup() {
   Serial.begin(115200);
+  SerialBT.begin("esp_pid");
 
-  pinMode(BUTTON_PIN, INPUT_PULLDOWN);   // active-HIGH button
+  pinMode(BUTTON_PIN, INPUT_PULLDOWN);
   pinMode(led, OUTPUT);
   digitalWrite(led, LOW);
 
-  // --- Motor pins ---
-  pinMode(lf, OUTPUT);
-  pinMode(lb, OUTPUT);
-  pinMode(rf, OUTPUT);
-  pinMode(rb, OUTPUT);
+  pinMode(lf, OUTPUT); pinMode(lb, OUTPUT);
+  pinMode(rf, OUTPUT); pinMode(rb, OUTPUT);
 
-  // --- Encoder pins ---
-  pinMode(L_ENC_A, INPUT_PULLUP);
-  pinMode(L_ENC_B, INPUT_PULLUP);
-  pinMode(R_ENC_A, INPUT_PULLUP);
-  pinMode(R_ENC_B, INPUT_PULLUP);
-
-  attachInterrupt(digitalPinToInterrupt(L_ENC_A), isr_left, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(R_ENC_A), isr_right, CHANGE);
-
-  // --- Sensor pins ---
   for (int i = 0; i < NUM_SENSORS; i++) {
     pinMode(sensorPins[i], INPUT);
   }
 
-  // ===============================
-  //  LOAD STORED PATH FROM NVS
-  // ===============================
-  end = 0;
+  while (digitalRead(BUTTON_PIN) == LOW) { delay(5); }
+  digitalWrite(led, HIGH); delay(200); digitalWrite(led, LOW);
 
-
-  // Wait for button press
-  while (digitalRead(BUTTON_PIN) == LOW) {
-    delay(5);
-  }
-  blinkLED(1);
-  if (!bno.begin()) {
-    while (1); // IMU failure
-  }
-
-  bno.setExtCrystalUse(true);
-  delay(1000); // allow gyro to stabilize
-
-  stateVar = 0;
-
-  delay(50);
-
+  SerialBT.println("Ready. S=Start  E=Stop  C=Tune Kp/Kd");
 }
 
-
-
+// ═════════════════════════════════════════════
+//  MAIN LOOP
+// ═════════════════════════════════════════════
 void loop() {
-  int buttonState = digitalRead(BUTTON_PIN);
-update();
-
-  // =========================
-  // ===== DFS EXPLORATION ===
-
-
-    if (end == 1) {
-      stop();
-      delay(100);
-      digitalWrite(16, HIGH);
-      while (1);
-    }
-
-    // -------- JUNCTION CANDIDATE DETECTION --------
-bool junctionCandidate =
-    (r3 == 0 && r4 == 0 && l3 == 0 && l4 == 0 && r2 == 0 && r1 == 0 && l2 == 0 && l1 == 0) ||
-    (r2 == 0 && r3 == 0 && r4 == 0 && l3 == 1 && l4 == 1) ||
-    (r3 == 1 && r4 == 1 && l3 == 0 && l4 == 0 && l2 == 0)||(r3 == 1 && r4 == 1 && l3 == 1 && l4 == 1 && r2 == 1 && r1 == 1 && l2 == 1 && l1 == 1);
-
-    if (junctionCandidate) {
-      stop();
-      forward(speed, 1);
-      delay(5);
-      update();
-
-      // ===== T Junction =====
-      if (r3 == 0 && r4 == 0 && l3 == 0 && l4 == 0 &&
-          r2 == 0 && r1 == 0 && l2 == 0 && l1 == 0) {
-
-        stop();
-        forward(speed, 6);
-        stop();
-        update();
-
-        if (r3 == 0 && r4 == 0 && l3 == 0 && l4 == 0 &&
-            r2 == 0 && r1 == 0 && l2 == 0 && l1 == 0) {
-          end = 1;
-        } else {
-          float startYaw = getYaw();
-          float target = startYaw - 90;
-          if (target < 0) target += 360;
-          left(speed);
-        }
-        return;
-      }
-
-      // ===== LEFT JUNCTION =====
-      if (r3 == 1 && r4 == 1 && l3 == 0 && l4 == 0 && l2 == 0) {
-        stop();
-        forward(speed, 6);
-        stop();
-        update();
-
-        if (r3 == 1 && r4 == 1 && l3 == 0 && l4 == 0 && l2 == 0) {
-          end = 1;
-        } else {
-          float target = getYaw() - 90;
-          if (target < 0) target += 360;
-          left(speed);
-        }
-        return;
-      }
-
-      // ===== RIGHT / STRAIGHT =====
-      if (r3 == 0 && r4 == 0 && l3 == 1 && l4 == 1 && r2 == 0) {
-        stop();
-        forward(speed, 6);
-        stop();
-        update();
-
-        if (r3 == 0 && r4 == 0 && l3 == 1 && l4 == 1) {
-          end = 1;
-        } else {
-          if (l1 && l2 && l3 && l4 && r1 && r2 && r3 && r4) {
-            float target = getYaw() + 80;
-            right(speed);
-          } 
-        }
-        return;
-      }
-
-      // ===== U TURN =====
-      if (l1 && l2 && l3 && l4 && r1 && r2 && r3 && r4) {
-        forward(speed,6);
-        update();
-        if(l1 && l2 && l3 && l4 && r1 && r2 && r3 && r4){
-        u_turn(speed);}
-        else{
-          return;
-        }
-      }
-    }
-    update();
-if(l2 == 0){ // gentle left turn
-    analogWrite(lf, 0);
-    analogWrite(lb, 0);
-    analogWrite(rf, 200);
-    analogWrite(rb, 0);
-  }
-  else if(l3 == 0 || l4 == 0){ // sharp left turn
-    analogWrite(lf, 0);
-    analogWrite(lb, 0);
-    analogWrite(rf, 255);
-    analogWrite(rb, 0);
-  }
-  else if(r2 == 0){ // gentle right turn
-    analogWrite(lf, 200);
-    analogWrite(lb, 0);
-    analogWrite(rf, 0);
-    analogWrite(rb, 0);
-  }
-  else if(r3 == 0 || r4 == 0){ // sharp right turn
-    analogWrite(lf, 255);
-    analogWrite(lb, 0);
-    analogWrite(rf, 0);
-    analogWrite(rb, 0);
-  }
-  else{ // go straight
-    analogWrite(lf, 255);
-    analogWrite(lb, 0);
-    analogWrite(rf, 255);
-    analogWrite(rb, 0);
-  }
+  handleBluetooth();
+  if (!running) return;
+  pdLineFollow();
 }
-
-
